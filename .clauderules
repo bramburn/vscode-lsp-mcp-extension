@@ -1,0 +1,119 @@
+# .clauderules — IDE-LSP for MCP
+
+Strict, project-specific guardrails for the `vscode-lsp-mcp-extension` repo.
+Authoritative. If a generic AI pattern contradicts this file, this file wins.
+
+Companion rules (load alongside this file):
+- `AGENTS.md`, `CLAUDE.md` — repo-wide agent rules (incl. i18n)
+- `.claude/rules/claude-dev-patterns.md` — command/tool/protocol templates
+- `.claude/rules/testing-strategy.md` — test layout, commands, `McpTestClient`
+- `.claude/rules/i18n.md` — bilingual text rules
+- `.claude/skills/claude-dev-patterns.md` — condensed task skill
+
+---
+
+## 1. Architectural Constraints (non-negotiable)
+
+The system is a **two-process architecture**. Never collapse it.
+
+- **Standalone MCP Server** (`src/server/*`, entry `src/server/main.ts`)
+  - Pure Node.js, no `import "vscode"` ever. `external: ['vscode']` is only on the extension bundle.
+  - Exposes HTTP/SSE on `MCP_ENDPOINT = "/mcp"` and `HEALTH_PATH = "/health"` (port `DEFAULT_PORT = 53221`).
+  - Owns `ClientRegistry`, `TaskManager`, `WebSocketServer`, `MCPTools`, `ShutdownManager`, `StateFileWatcher`.
+- **VSCode Extension Host** (`src/client/*`, entry `src/extension.ts`)
+  - Runs per-window. Connects OUT via WebSocket (`WS_PATH = "/ws"`) to the server as a client.
+  - Owns LSP execution via `vscode.commands.executeCommand(...)`; server never calls VS Code APIs.
+- **Shared code** (`src/shared/*`) MUST be safe for both runtimes (no `vscode` imports, no Node-only APIs in hot paths used by both).
+
+**Request flow (the only allowed flow for a tool call):**
+`MCP Client → MCP Server (HTTP/SSE) → TaskManager.dispatch → WebSocket → Window → TaskExecutor → BaseTool.execute → vscode LSP → ResultMessage → MCP Server → MCP Client`.
+Do not add sidechannels, direct HTTP calls from window → server for tool data, or cross-window calls.
+
+### Smart Routing rule
+- Every tool (except `listOpenProjects`) MUST accept a REQUIRED `projectPath: string` argument, resolved via `ClientRegistry.findByProjectPath()` (which uses `ClientRegistry.normalizePath()`).
+- Never fan-out a tool call to all windows. One `projectPath` → exactly one `ClientInfo` → one WebSocket.
+- If `findByProjectPath` returns `undefined`, the MCP tool MUST return a typed error; never silently pick another window.
+
+### Protocol integrity
+- The only wire types are `ClientMessage` / `ServerMessage` in `src/shared/protocol.ts`. Adding a message REQUIRES: (a) interface, (b) add to the correct union, (c) switch case in both `McpServer.ts` and `client/ServerConnection.ts`. See `.claude/rules/claude-dev-patterns.md` §3.
+- Never widen `TaskMessage.args` to a non-`Record<string, unknown>` type; keep the boundary typed at the tool layer.
+
+---
+
+## 2. Coding Standards & Patterns
+
+### TypeScript & runtime
+- Target: Node `22.x`, `@types/vscode ^1.85.0`, `typescript ^5.9.3`, `strict` mode.
+- No `any` in new code; cast `args` at the boundary inside `execute()` only (mirror existing tools: `args.projectPath as string`).
+- Use `import type { ... }` for type-only imports across the `shared` boundary.
+- Path normalization for any project path comparison MUST go through `ClientRegistry.normalizePath` / `containsPath` — never string-compare raw paths.
+
+### New MCP tool template (follow existing tools verbatim)
+1. `src/server/MCPTools.ts` — add entry to `TOOL_SCHEMAS` using the shared zod primitives (`projectPath`, `filePath`, `line`, `character`, `page`, `symbolName`). Required args: `projectPath` + whatever positional LSP inputs are needed. Paginated tools MUST include `page`.
+2. `src/client/tools/<Name>Tool.ts` — extend `BaseTool`; implement `readonly name`, `execute(args)`, `format(result, args)`. Use `this.resolveUri(projectPath, filePath)` and convert `line` to 0-based (`line - 1`) to match VS Code.
+3. Re-export from `src/client/tools/index.ts`.
+4. Register the instance in `src/client/TaskExecutor.ts#registerTools()`.
+5. If the result is a list → use `PaginationHelper.paginate` + `PaginationHelper.wrapPaginated`; default page size comes from `Config.getPageSize()` (setting `ide-lsp-mcp.pageSize`). Never implement ad-hoc pagination.
+6. Tool name in code = camelCase (e.g. `findReferences`); MCP exposes it prefixed with `IDE-` automatically.
+
+### Error handling (strict)
+- Disconnected/missing window: server-side, return a tool error payload (do NOT throw raw) when `ClientRegistry.findByProjectPath` is `undefined`; message must name the missing `projectPath`.
+- Invalid symbol/position: inside a tool, return a result object with `error` + `suggestedPositions` (see `FindReferencesTool`), don't throw. Use `SymbolValidator.validate` where a position + `symbolName` are accepted.
+- Timeouts: rely on `TaskManager` (`DEFAULT_TIMEOUT = 30000`). Do not add per-tool `setTimeout` unless the tool waits on an inherently async IDE event (e.g., diagnostics — then use the `ide-lsp-mcp.diagnosticsTimeout` setting).
+- WebSocket errors on the window side are owned by `ServerConnection` / `ConnectionManager`. New code MUST NOT call `ws.send` directly; go through the existing manager.
+
+### Logging
+- Extension-host side (anything under `src/client/` or `src/extension.ts`): record tool invocations via `DebugLogStore.add(...)` so they appear in the `ideLspMcpDebug` view (gated by `ide-lsp-mcp.enableDebug`). User-visible messages MUST go through `vscode.l10n.t(...)` + `vscode.window.show*Message`.
+- Server side (`src/server/*`): the existing `console.log("[Registry] ...")` / `[TaskManager]` / `[Connection]` tagged prefixes are the convention. Keep that prefix style; do not introduce a new logger library.
+- Never `console.log` raw user file contents or full LSP payloads; log IDs and sizes.
+
+---
+
+## 3. Development Workflow (Hooks & Skills)
+
+### Skills (how Claude should reason about LSP)
+- Symbol lookup: prefer `vscode.executeDocumentSymbolProvider` / `executeWorkspaceSymbolProvider` over text scans. Tools MUST reuse `ContextHelper`, `LocationHelper`, `SymbolValidator`, `SymbolProviderWarmup` rather than re-implement.
+- Diagnostics: use `vscode.languages.getDiagnostics(uri)` and honor `ide-lsp-mcp.diagnosticsTimeout` / `ide-lsp-mcp.contextLines` / `ide-lsp-mcp.nearestSymbolsCount`. Treat an empty diagnostic array as "not yet ready" only until the configured timeout.
+- Ranges: VS Code is 0-based; our MCP schema is 1-based for `line`, 0-based for `character`. Always convert at the `execute()` boundary, never in helpers.
+- Positions returned to the MCP client must also be 1-based for `line` (mirror `FindReferencesTool` output).
+
+### Hooks (already enforced, do not bypass)
+- `.claude/hooks/pre-commit-i18n-check.sh` — bilingual l10n coverage.
+- `.claude/hooks/pre-commit-protocol-check.sh` — protocol union/switch coherence.
+- `.claude/hooks/pre-commit-test-check.sh` — tests required for tool/protocol changes.
+If a hook fails, fix the cause; do not edit the hook to pass.
+
+### Test templates (see `.claude/rules/testing-strategy.md`)
+- **Unit** (Mocha `tdd` + `sinon`): place under `src/test/unit/<Name>.test.ts`. For WebSocket interactions, mock with `sinon.createStubInstance(WebSocket) as unknown as WebSocket` (see `src/test/unit/ClientRegistry.test.ts`). Run with `pnpm test-unit`.
+- **MCP integration**: add `src/test/testData/mcp/<toolName>.json` + `expected/<toolName>/*.md`, register in `src/test/integration/mcp.test.ts`, run `pnpm test-mcp`. Use `${projectPath}` placeholders; never hard-code machine paths.
+- **VS Code integration**: add to `src/test/extension.test.ts`; run `pnpm test`.
+- When adding a protocol message: add a case test to `src/test/unit/protocol.test.ts`. When adding dispatch logic: extend `src/test/unit/TaskManager.test.ts`.
+
+---
+
+## 4. File Structure & Build
+
+### Directory boundaries (enforced)
+- `src/server/**` — server only. No `import "vscode"`, no `@types/vscode` references.
+- `src/client/**` — extension host only. Free to use `vscode`. Do not import from `src/server/**`.
+- `src/shared/**` — must compile for both; no `vscode`, no `ws` server code. Cross-cutting types, constants, protocol, file locking.
+- `src/test/{unit,integration,testData}/**` — tests only. Production code never imports from here.
+- New utility shared by multiple tools → `src/client/utils/`. New server-only helper → `src/server/`. Never add helpers to `src/shared` unless genuinely dual-runtime.
+
+### esbuild (dual entry — do not break)
+`esbuild.js` defines two configs; both are built for prod/watch. Rules:
+- Extension: `entryPoints: ['src/extension.ts']` → `dist/extension.js`, `external: ['vscode']`, `platform: 'node'`, `format: 'cjs'`.
+- Server: `entryPoints: ['src/server/main.ts']` → `dist/server/main.js`, `external: []`, `platform: 'node'`, `format: 'cjs'`.
+- `--server-only` must keep building ONLY the server. `--watch` must watch BOTH unless `--server-only` is also set. `--production` toggles `minify` + disables sourcemaps on both.
+- Do not add a third entry point, do not switch format to ESM, do not mark `ws` / `@modelcontextprotocol/sdk` / `zod` as external on the server bundle.
+- `package.json#main` stays `./dist/extension.js`.
+
+### Package management
+- Always use `pnpm` (matches `pnpm-lock.yaml`, `pnpm-workspace.yaml`). Never hand-edit `dependencies`/`devDependencies`; use `pnpm add` / `pnpm add -D` / `pnpm remove`.
+- New VS Code `contributes.*` entries MUST come with matching keys in `package.nls.json` + `package.nls.zh-cn.json`.
+
+### Before any PR
+- `pnpm run check-types && pnpm run lint && pnpm run compile`
+- Run the affected suite: `pnpm test-unit` / `pnpm test-mcp` / `pnpm test`.
+- Confirm the i18n, protocol, and test pre-commit hooks pass locally.
+
